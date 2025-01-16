@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <title>HeyGen Avatar Player</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/livekit-client/dist/livekit-client.umd.min.js"></script>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  </head>
+
+  <body class="bg-transparent">
+    <div class="relative w-full h-full">
+      <video
+        id="mediaElement"
+        class="w-full h-full"
+        autoplay
+        playsinline
+      ></video>
+      
+      <!-- Loading Overlay -->
+      <div id="loadingOverlay" class="absolute inset-0 bg-black bg-opacity-50 flex flex-col items-center justify-center">
+        <div class="text-white text-xl mb-4">Initializing Avatar...</div>
+        <div class="w-64 h-2 bg-gray-200 rounded-full">
+          <div id="progressBar" class="h-full bg-blue-500 rounded-full transition-all duration-300" style="width: 0%"></div>
+        </div>
+        <div id="statusText" class="text-white mt-2">Starting session...</div>
+      </div>
+    </div>
+
+    <script>
+      // Create global HeyGenPlayer object
+      window.HeyGenPlayer = {};
+
+      // Configuration
+      const API_CONFIG = {
+        apiKey: "ZGNhNTQyYjdkZGQ0NGM2OTlmMTBiMDgxMGI0YmVmZmEtMTczMDg4ODA0OA==",
+        serverUrl: "https://api.heygen.com",
+      };
+
+      // Global variables
+      let sessionInfo = null;
+      let room = null;
+      let mediaStream = null;
+      let webSocket = null;
+      let sessionToken = null;
+      let isInitialized = false;
+      let initializationAttempts = 0;
+      let maxInitializationAttempts = 3;
+      let avatarConfig = {
+        avatarId: "",  // Default avatar ID
+        voiceId: ""     // Default voice ID
+      };
+
+      const mediaElement = document.getElementById("mediaElement");
+      const loadingOverlay = document.getElementById("loadingOverlay");
+      const progressBar = document.getElementById("progressBar");
+      const statusText = document.getElementById("statusText");
+
+      // Update loading progress
+      function updateProgress(percent, status) {
+        progressBar.style.width = `${percent}%`;
+        if (status) {
+          statusText.textContent = status;
+        }
+      }
+
+      // Show/Hide loading overlay
+      function toggleLoading(show) {
+        loadingOverlay.style.display = show ? "flex" : "none";
+      }
+
+      // Reset session
+      function resetSession() {
+        sessionInfo = null;
+        room = null;
+        mediaStream = null;
+        webSocket = null;
+        sessionToken = null;
+        isInitialized = false;
+        initializationAttempts = 0;
+        mediaElement.srcObject = null;
+      }
+
+      // Get session token
+      async function getSessionToken() {
+        try {
+          updateProgress(20, "Getting session token...");
+          const response = await fetch(
+            `${API_CONFIG.serverUrl}/v1/streaming.create_token`,
+            {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "X-Api-Key": API_CONFIG.apiKey,
+                "Accept": "application/json"
+              },
+            }
+          );
+
+          if (!response.ok) {
+            throw new Error(`HTTP error! status: ${response.status}`);
+          }
+
+          const data = await response.json();
+          if (!data || !data.data || !data.data.token) {
+            throw new Error('Invalid token response');
+          }
+          sessionToken = data.data.token;
+          return true;
+        } catch (error) {
+          console.error("Error getting session token:", error);
+          return false;
+        }
+      }
+
+      // Connect WebSocket
+      async function connectWebSocket(sessionId) {
+        try {
+          updateProgress(60, "Connecting to WebSocket...");
+          const params = new URLSearchParams({
+            session_id: sessionId,
+            session_token: sessionToken,
+            silence_response: false,
+            opening_text: "",
+            stt_language: "en",
+          });
+
+          const wsUrl = `wss://${
+            new URL(API_CONFIG.serverUrl).hostname
+          }/v1/ws/streaming.chat?${params}`;
+
+          webSocket = new WebSocket(wsUrl);
+          
+          // Add WebSocket event handlers
+          webSocket.onopen = () => console.log("WebSocket connected");
+          webSocket.onerror = (error) => console.error("WebSocket error:", error);
+          webSocket.onclose = () => console.log("WebSocket closed");
+          
+          return true;
+        } catch (error) {
+          console.error("Error connecting WebSocket:", error);
+          return false;
+        }
+      }
+
+      // Create new session
+      async function createNewSession() {
+        try {
+          updateProgress(40, "Creating new session...");
+          if (!sessionToken) {
+            const tokenSuccess = await getSessionToken();
+            if (!tokenSuccess) {
+              throw new Error('Failed to get session token');
+            }
+          }
+
+          const sessionData = {
+            quality: "high",
+            avatar_name: avatarConfig.avatarId,
+            voice: {
+              voice_id: avatarConfig.voiceId,
+              rate: 2,
+            },
+            knowledge_base:"Your a assistant",
+            version: "v2",
+            video_encoding: "H264",
+          };
+
+          console.log("Creating session with data:", sessionData);
+
+          const response = await fetch(
+            `${API_CONFIG.serverUrl}/v1/streaming.new`,
+            {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "Authorization": `Bearer ${sessionToken}`,
+              },
+              body: JSON.stringify(sessionData),
+            }
+          );
+
+          if (!response.ok) {
+            const errorText = await response.text();
+            console.error("Session creation response:", errorText);
+            throw new Error(`HTTP error! status: ${response.status}`);
+          }
+
+          const data = await response.json();
+          console.log("Session creation response:", data);
+          
+          if (!data || !data.data) {
+            throw new Error('Invalid session response');
+          }
+          
+          sessionInfo = data.data;
+
+          updateProgress(80, "Setting up video connection...");
+          room = new LivekitClient.Room({
+            adaptiveStream: true,
+            dynacast: true,
+            videoCaptureDefaults: {
+              resolution: LivekitClient.VideoPresets.h720.resolution,
+            },
+          });
+
+          mediaStream = new MediaStream();
+          room.on(LivekitClient.RoomEvent.TrackSubscribed, (track) => {
+            if (track.kind === "video" || track.kind === "audio") {
+              mediaStream.addTrack(track.mediaStreamTrack);
+              if (
+                mediaStream.getVideoTracks().length > 0 &&
+                mediaStream.getAudioTracks().length > 0
+              ) {
+                mediaElement.srcObject = mediaStream;
+                mediaElement.play().catch(console.error);
+                toggleLoading(false);
+              }
+            }
+          });
+
+          room.on(LivekitClient.RoomEvent.TrackUnsubscribed, (track) => {
+            const mediaTrack = track.mediaStreamTrack;
+            if (mediaTrack) {
+              mediaStream.removeTrack(mediaTrack);
+            }
+          });
+
+          room.on(LivekitClient.RoomEvent.Disconnected, () => {
+            resetSession();
+            toggleLoading(true);
+            updateProgress(0, "Connection lost. Reconnecting...");
+            initialize();
+          });
+
+          await room.prepareConnection(sessionInfo.url, sessionInfo.access_token);
+          await connectWebSocket(sessionInfo.session_id);
+          return true;
+        } catch (error) {
+          console.error("Error creating session:", error);
+          return false;
+        }
+      }
+
+      // Start streaming session
+      async function startStreamingSession() {
+        try {
+          updateProgress(90, "Starting streaming session...");
+          const startResponse = await fetch(
+            `${API_CONFIG.serverUrl}/v1/streaming.start`,
+            {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${sessionToken}`,
+              },
+              body: JSON.stringify({
+                session_id: sessionInfo.session_id,
+              }),
+            }
+          );
+
+          if (!startResponse.ok) {
+            throw new Error(`HTTP error! status: ${startResponse.status}`);
+          }
+
+          await room.connect(sessionInfo.url, sessionInfo.access_token);
+          isInitialized = true;
+          updateProgress(100, "Ready!");
+          return true;
+        } catch (error) {
+          console.error("Error starting session:", error);
+          return false;
+        }
+      }
+
+      // Send text to avatar
+      async function sendText(text, taskType = "talk") {
+        try {
+          if (!isInitialized || !sessionInfo) {
+            toggleLoading(true);
+            updateProgress(0, "Reconnecting session...");
+            await initialize();
+          }
+
+          if (!sessionInfo || !sessionInfo.session_id) {
+            throw new Error('No active session');
+          }
+
+          const response = await fetch(
+            `${API_CONFIG.serverUrl}/v1/streaming.task`,
+            {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${sessionToken}`,
+              },
+              body: JSON.stringify({
+                session_id: sessionInfo.session_id,
+                text: text,
+                task_type: taskType,
+              }),
+            }
+          );
+
+          if (!response.ok) {
+            throw new Error(`HTTP error! status: ${response.status}`);
+          }
+
+          return true;
+        } catch (error) {
+          console.error("Error sending text:", error);
+          return false;
+        }
+      }
+
+      // Close session
+      async function closeSession() {
+        try {
+          if (!sessionInfo) return;
+
+          const response = await fetch(
+            `${API_CONFIG.serverUrl}/v1/streaming.stop`,
+            {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${sessionToken}`,
+              },
+              body: JSON.stringify({
+                session_id: sessionInfo.session_id,
+              }),
+            }
+          );
+
+          if (!response.ok) {
+            throw new Error(`HTTP error! status: ${response.status}`);
+          }
+
+          if (webSocket) {
+            webSocket.close();
+          }
+          if (room) {
+            room.disconnect();
+          }
+
+          resetSession();
+        } catch (error) {
+          console.error("Error closing session:", error);
+        }
+      }
+
+      // Initialize the avatar
+      async function initialize() {
+        try {
+          if (isInitialized) return true;
+          
+          if (initializationAttempts >= maxInitializationAttempts) {
+            updateProgress(0, "Failed to initialize after multiple attempts");
+            return false;
+          }
+
+          initializationAttempts++;
+          updateProgress(10, `Initialization attempt ${initializationAttempts}...`);
+          
+          const sessionCreated = await createNewSession();
+          if (!sessionCreated) {
+            throw new Error('Failed to create session');
+          }
+
+          const streamingStarted = await startStreamingSession();
+          if (!streamingStarted) {
+            throw new Error('Failed to start streaming');
+          }
+
+          return true;
+        } catch (error) {
+          console.error("Error initializing:", error);
+          if (initializationAttempts < maxInitializationAttempts) {
+            console.log("Retrying initialization...");
+            await new Promise(resolve => setTimeout(resolve, 2000)); // Wait 2 seconds before retry
+            return initialize();
+          }
+          return false;
+        }
+      }
+
+      // Expose functions through HeyGenPlayer object
+      HeyGenPlayer.init = initialize;
+      HeyGenPlayer.talk = async function(text) {
+        return await sendText(text, "talk");
+      };
+      HeyGenPlayer.repeat = async function(text) {
+        return await sendText(text, "repeat");
+      };
+      HeyGenPlayer.close = async function() {
+        await closeSession();
+      };
+
+      // Initialize when page loads
+      window.addEventListener('load', () => {
+        toggleLoading(true);
+        updateProgress(0, "Starting initialization...");
+        initialize();
+      });
+
+      // Also expose functions globally for Storyline
+      window.initAvatar = initialize;
+      window.talk = HeyGenPlayer.talk;
+      window.repeat = HeyGenPlayer.repeat;
+      window.closeAvatar = HeyGenPlayer.close;
+    </script>
+  </body>
+</html>
